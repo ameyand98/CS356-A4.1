@@ -1,5 +1,8 @@
+from concurrent.futures import thread
 import enum
 import logging
+
+from numpy import greater
 import llp
 import queue
 import struct
@@ -51,6 +54,10 @@ class SWPPacket:
 class SWPSender:
     _SEND_WINDOW_SIZE = 5
     _TIMEOUT = 1
+    send_semaphore = None
+    last_ack_recv = -1
+    last_frame_sent = -1
+    send_buffer = []
 
     def __init__(self, remote_address, loss_probability=0):
         self._llp_endpoint = llp.LLPEndpoint(remote_address=remote_address,
@@ -61,7 +68,7 @@ class SWPSender:
         self._recv_thread.start()
 
         # TODO: Add additional state variables
-
+        self.send_semaphore = threading.Semaphore(self._SEND_WINDOW_SIZE)
 
     def send(self, data):
         for i in range(0, len(data), SWPPacket.MAX_DATA_SIZE):
@@ -69,12 +76,33 @@ class SWPSender:
 
     def _send(self, data):
         # TODO
+        self.send_semaphore.acquire()
+        packet = SWPPacket(SWPType.DATA, data)
+        packet.seq_num = self.last_frame_sent + 1 
+        buffer_idx = packet.seq_num % self._SEND_WINDOW_SIZE  
+        # self.send_buffer.append(packet)
+        if len(self.send_buffer) >= 5:
+            logging.error("Sending a packet when the send window is full!")
+        packet_timer = threading.Timer(self._TIMEOUT, self._retransmit, [packet.seq_num])
+        self.send_buffer[buffer_idx] = (packet, packet_timer)
+        # self.send_buffer.insert(buffer_idx, (packet, packet_timer))
 
+        self._llp_endpoint.send(packet.to_bytes())
+        packet_timer.start()
+        self.last_frame_sent = packet.seq_num
         return
         
     def _retransmit(self, seq_num):
         # TODO
+        buffer_idx = seq_num % self._SEND_WINDOW_SIZE
+        retransmit_pkt_info = self.send_buffer[buffer_idx]
+        retransmit_pkt = retransmit_pkt_info[0]
 
+        new_pkt_timer = threading.Timer(self._TIMEOUT, self._retransmit, [retransmit_pkt.seq_num])
+        self.send_buffer[buffer_idx] = (retransmit_pkt, new_pkt_timer)
+        self._llp_endpoint.send(retransmit_pkt.to_bytes())
+
+        new_pkt_timer.start()
         return 
 
     def _recv(self):
@@ -87,7 +115,23 @@ class SWPSender:
             logging.debug("Received: %s" % packet)
 
             # TODO
+            if packet.type is SWPType.ACK:
+                ack_seq_num = packet.seq_num
+                
+                if self.last_ack_recv < ack_seq_num:
+                    for seq_num in range(self.last_ack_recv + 1, ack_seq_num + 1):
+                        buffer_idx = seq_num % self._SEND_WINDOW_SIZE
+                        sent_pkt_info = self.send_buffer.pop(buffer_idx)
+                        sent_pkt_timer = sent_pkt_info[1]
+                        sent_pkt_timer.cancel()
 
+                        sent_pkt = sent_pkt_info[0]
+                        self.send_semaphore.release()
+                else:
+                    logging.error("acknowledging a packet seq num that's already been ack")
+                
+                self.last_ack_recv = ack_seq_num
+                
         return
 
 class SWPReceiver:
