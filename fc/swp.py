@@ -34,6 +34,15 @@ class SWPPacket:
     def data(self):
         return self._data
 
+    def set_type(self, new_type):
+        self._type = new_type
+
+    def set_seq_num(self, seq_num):
+        self._seq_num = seq_num
+    
+    def set_data(self, data):
+        self._data = data
+
     def to_bytes(self):
         header = struct.pack(SWPPacket._PACK_FORMAT, self._type.value, 
                 self._seq_num)
@@ -57,7 +66,7 @@ class SWPSender:
     send_semaphore = None
     last_ack_recv = -1
     last_frame_sent = -1
-    send_buffer = []
+    
 
     def __init__(self, remote_address, loss_probability=0):
         self._llp_endpoint = llp.LLPEndpoint(remote_address=remote_address,
@@ -69,6 +78,7 @@ class SWPSender:
 
         # TODO: Add additional state variables
         self.send_semaphore = threading.Semaphore(self._SEND_WINDOW_SIZE)
+        self.send_buffer = [None for _ in range(self._SEND_WINDOW_SIZE)]
 
     def send(self, data):
         for i in range(0, len(data), SWPPacket.MAX_DATA_SIZE):
@@ -76,13 +86,13 @@ class SWPSender:
 
     def _send(self, data):
         # TODO
+        # acquire sem
         self.send_semaphore.acquire()
-        packet = SWPPacket(SWPType.DATA, data)
-        packet.seq_num = self.last_frame_sent + 1 
+        packet = SWPPacket(SWPType.DATA, seq_num=self.last_frame_sent + 1 , data=data)
         buffer_idx = packet.seq_num % self._SEND_WINDOW_SIZE  
         # self.send_buffer.append(packet)
-        if len(self.send_buffer) >= 5:
-            logging.error("Sending a packet when the send window is full!")
+        # if len(self.send_buffer) >= 5:
+        #     logging.error("Sending a packet when the send window is full!")
         packet_timer = threading.Timer(self._TIMEOUT, self._retransmit, [packet.seq_num])
         self.send_buffer[buffer_idx] = (packet, packet_timer)
         # self.send_buffer.insert(buffer_idx, (packet, packet_timer))
@@ -94,6 +104,7 @@ class SWPSender:
         
     def _retransmit(self, seq_num):
         # TODO
+        self.send_semaphore.acquire()
         buffer_idx = seq_num % self._SEND_WINDOW_SIZE
         retransmit_pkt_info = self.send_buffer[buffer_idx]
         retransmit_pkt = retransmit_pkt_info[0]
@@ -121,7 +132,7 @@ class SWPSender:
                 if self.last_ack_recv < ack_seq_num:
                     for seq_num in range(self.last_ack_recv + 1, ack_seq_num + 1):
                         buffer_idx = seq_num % self._SEND_WINDOW_SIZE
-                        sent_pkt_info = self.send_buffer.pop(buffer_idx)
+                        sent_pkt_info = self.send_buffer[buffer_idx]
                         sent_pkt_timer = sent_pkt_info[1]
                         sent_pkt_timer.cancel()
 
@@ -136,9 +147,6 @@ class SWPSender:
 
 class SWPReceiver:
     _RECV_WINDOW_SIZE = 5
-    
-    
-
 
     def __init__(self, local_address, loss_probability=0):
         self._llp_endpoint = llp.LLPEndpoint(local_address=local_address, 
@@ -169,33 +177,29 @@ class SWPReceiver:
             logging.debug("Received: %s" % packet)
             
             # TODO
-            curSeqNum = packet.seq_num()
-            if curSeqNum <= self.last_frame_recv or curSeqNum > self.last_frame_recv + self._RECV_WINDOW_SIZE:
-                #The Packet is outside of our window range -> drop packet
-                continue
+            curSeqNum = packet.seq_num
+            #The Packet is in range of our window -> process (ONLY DATA)
+            assert packet.type == SWPType.DATA
+
+            if packet.seq_num < self.highest_ack_seq_num:
+                #acknowledged already and ACK can be sent back
+                ack_packet = SWPPacket(SWPType.ACK, seq_num=self.highest_ack_seq_num)
+                self._llp_endposint.send(ack_packet.to_bytes())
             else:
-                #The Packet is in range of our window -> process (ONLY DATA)
-                assert packet.type() == SWP.DATA
-
-                if packet.seq_num <= self.highest_ack_seq_num:
-                    #acknowledged already and ACK can be sent back
-                    ack_packet = SWPPacket(SWP.ACK, packet.data())
-                    self._llp_endpoint.send(packet.to_bytes())
-                    continue
-                else:
-                    #Received out of order -> add to buffer
-                    buffer[packet.seq_num % self._RECV_WINDOW_SIZE] = packet
-                    buffer_idx = 0
-                    #Traverse 
-                    while buffer_idx < self._RECV_WINDOW_SIZE and buffer[buffer_idx] is not None:
-                        self._ready_data.put(buffer[buffer_idx])
-                        buffer[buffer_idx] = None
-                        self.highest_ack_seq_num = buffer_idx if self.highest_ack_seq_num == -1 else (self.highest_ack_seq_num // self._RECV_WINDOW_SIZE) * self._RECV_WINDOW_SIZE + buffer_idx
-                        buffer_idx += 1
-                        
-
-
+                #Received out of order -> add to buffer
+                self.recv_buffer[packet.seq_num % self._RECV_WINDOW_SIZE] = packet
+                buffer_idx = 0
+                while buffer_idx < self._RECV_WINDOW_SIZE and self.recv_buffer[buffer_idx] is None:
+                    buffer_idx += 1
+                #Traverse 
+                print(f'${self.highest_ack_seq_num}, ${self.recv_buffer}')
+                while buffer_idx < self._RECV_WINDOW_SIZE and self.recv_buffer[buffer_idx] is not None:
+                    self._ready_data.put(self.recv_buffer[buffer_idx].to_bytes())
+                    self.highest_ack_seq_num = self.recv_buffer[buffer_idx].seq_num
+                    self.recv_buffer[buffer_idx] = None
+                    buffer_idx += 1
+                print(f'${self.highest_ack_seq_num}, ${self.recv_buffer}')
                 #Send an acknowledgement for the highest sequence number for which all data chunks up to and including that sequence number have been received.
-                ack_packet = SWPPacket(SWP.ACK, seq_num=packet.seq_num())
-                self._llp_endpoint.send(packet.to_bytes())
+                ack_packet = SWPPacket(SWPType.ACK, seq_num=self.highest_ack_seq_num)
+                self._llp_endpoint.send(ack_packet.to_bytes())
         return
