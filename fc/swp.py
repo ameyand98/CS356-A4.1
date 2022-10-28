@@ -136,6 +136,9 @@ class SWPSender:
 
 class SWPReceiver:
     _RECV_WINDOW_SIZE = 5
+    
+    
+
 
     def __init__(self, local_address, loss_probability=0):
         self._llp_endpoint = llp.LLPEndpoint(local_address=local_address, 
@@ -149,6 +152,8 @@ class SWPReceiver:
         self._recv_thread.start()
         
         # TODO: Add additional state variables
+        self.highest_ack_seq_num = -1
+        self.recv_buffer = [None for _ in range(self._RECV_WINDOW_SIZE)]
 
 
     def recv(self):
@@ -158,9 +163,39 @@ class SWPReceiver:
         while True:
             # Receive data packet
             raw = self._llp_endpoint.recv()
+            if raw is None:
+                continue    
             packet = SWPPacket.from_bytes(raw)
             logging.debug("Received: %s" % packet)
             
             # TODO
+            curSeqNum = packet.seq_num()
+            if curSeqNum <= self.last_frame_recv or curSeqNum > self.last_frame_recv + self._RECV_WINDOW_SIZE:
+                #The Packet is outside of our window range -> drop packet
+                continue
+            else:
+                #The Packet is in range of our window -> process (ONLY DATA)
+                assert packet.type() == SWP.DATA
 
+                if packet.seq_num <= self.highest_ack_seq_num:
+                    #acknowledged already and ACK can be sent back
+                    ack_packet = SWPPacket(SWP.ACK, packet.data())
+                    self._llp_endpoint.send(packet.to_bytes())
+                    continue
+                else:
+                    #Received out of order -> add to buffer
+                    buffer[packet.seq_num % self._RECV_WINDOW_SIZE] = packet
+                    buffer_idx = 0
+                    #Traverse 
+                    while buffer_idx < self._RECV_WINDOW_SIZE and buffer[buffer_idx] is not None:
+                        self._ready_data.put(buffer[buffer_idx])
+                        buffer[buffer_idx] = None
+                        self.highest_ack_seq_num = buffer_idx if self.highest_ack_seq_num == -1 else (self.highest_ack_seq_num // self._RECV_WINDOW_SIZE) * self._RECV_WINDOW_SIZE + buffer_idx
+                        buffer_idx += 1
+                        
+
+
+                #Send an acknowledgement for the highest sequence number for which all data chunks up to and including that sequence number have been received.
+                ack_packet = SWPPacket(SWP.ACK, seq_num=packet.seq_num())
+                self._llp_endpoint.send(packet.to_bytes())
         return
