@@ -104,7 +104,6 @@ class SWPSender:
         
     def _retransmit(self, seq_num):
         # TODO
-        self.send_semaphore.acquire()
         buffer_idx = seq_num % self._SEND_WINDOW_SIZE
         retransmit_pkt_info = self.send_buffer[buffer_idx]
         retransmit_pkt = retransmit_pkt_info[0]
